@@ -1,7 +1,7 @@
 # HushNote
 > Privacy-First Local-First AI Note Drafting Assistant for Therapists
 
-HushNote is a local-first, privacy-focused clinical note drafting prototype designed to help mental health professionals draft structured DAP and SOAP notes from session audio snippets without compromising client confidentiality or storing raw audio data permanently.
+HushNote is a local-first, privacy-focused clinical note-drafting prototype designed to help mental health professionals draft structured DAP and SOAP notes from session audio snippets without compromising client confidentiality or permanently storing raw audio data.
 
 ---
 
