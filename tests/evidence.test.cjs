@@ -1,0 +1,147 @@
+/**
+ * Evidence chips on the review screen.
+ *
+ * Regression cover for a chip that showed "00:15" for any quote without a
+ * timestamp: an invented moment rendered exactly like a real one, the same
+ * failure as the fabricated fallback note and the length-derived CPT code. A
+ * chip shows a time only when the draft supplied one that reads as a clock
+ * time; otherwise it says the time is not available.
+ *
+ * Each chip also says how the server found its quote in the transcript. An
+ * abridged quote and an unverified one must each read differently from a
+ * verbatim quote in shape and words, not colour alone, and a quote the server
+ * did not mark as found is never presented as if it were.
+ */
+const { boot, createChecker } = require('./harness.cjs');
+
+const draftWith = (evidence) => ({
+  fallback: false,
+  note: { data: ['Drafted.'], assessment: ['Assessed.'], plan: ['Planned.'] },
+  evidence,
+  missing_fields: [],
+  readiness: { completed: true, label: 'Ready', checksPassed: [], missing: [] },
+});
+
+/** An evidence item the server found word for word. */
+const verbatim = (fields) => ({ ...fields, quoteStatus: 'verbatim' });
+
+module.exports = async function run() {
+  const { check, results } = createChecker('evidence');
+  const { window, App, $ } = await boot();
+
+  App.state.selectedFormat = 'DAP';
+
+  /** What a clinician sees on each chip: its text, and whether it carries the clock icon. */
+  const chips = () => [...$('evidenceChips').children].map((chip) => ({
+    text: chip.textContent.replace(/\s+/g, ' ').trim(),
+    clockIcon: !!chip.querySelector('svg[data-icon="clock"]'),
+  }));
+  const render = (evidence) => {
+    App.state.noteOriginals = {};
+    App.state.noteEdits = {};
+    App.renderReviewScreen(draftWith(evidence));
+    return chips();
+  };
+  const timed = (time, quote) => ({ text: `${time} “${quote}”`, clockIcon: true });
+  const untimed = (quote) => ({ text: `time not available “${quote}”`, clockIcon: false });
+
+  console.log('\n  -- a real timestamp is shown as given');
+  check('mm:ss', render([verbatim({ quote: 'It has been a hard week.', timestamp: '01:30' })]), [timed('01:30', 'It has been a hard week.')]);
+  check('bracketed, as the transcript writes it', render([verbatim({ quote: 'Bracketed.', timestamp: '[05:30]' })]), [timed('05:30', 'Bracketed.')]);
+  check('h:mm:ss', render([verbatim({ quote: 'Late in a long session.', timestamp: '1:02:03' })]), [timed('1:02:03', 'Late in a long session.')]);
+
+  console.log('\n  -- a missing timestamp is never filled in');
+  check('no timestamp field', render([verbatim({ quote: 'No field.' })]), [untimed('No field.')]);
+  check('empty string', render([verbatim({ quote: 'Empty.', timestamp: '' })]), [untimed('Empty.')]);
+  check('whitespace only', render([verbatim({ quote: 'Blank.', timestamp: '   ' })]), [untimed('Blank.')]);
+  check('null', render([verbatim({ quote: 'Null.', timestamp: null })]), [untimed('Null.')]);
+
+  console.log('\n  -- a value that is not a clock time is not shown as one');
+  check('prose from the model', render([verbatim({ quote: 'Prose.', timestamp: 'Not documented' })]), [untimed('Prose.')]);
+  check('a bare number', render([verbatim({ quote: 'Number.', timestamp: 90 })]), [untimed('Number.')]);
+  check('markup', render([verbatim({ quote: 'Markup.', timestamp: '<b>01:30</b>' })]), [untimed('Markup.')]);
+
+  console.log('\n  -- mixed evidence keeps each chip honest');
+  check('timed and untimed side by side',
+    render([verbatim({ quote: 'Timed.', timestamp: '12:00' }), verbatim({ quote: 'Untimed.' })]),
+    [timed('12:00', 'Timed.'), untimed('Untimed.')]);
+  check('no invented time anywhere on the panel', /00:15/.test($('evidenceChips').textContent), false);
+
+  /** How each chip presents its quote status, beyond its text. */
+  const looks = (evidence) => {
+    render(evidence);
+    return [...$('evidenceChips').children].map((chip) => ({
+      status: chip.dataset.quoteStatus,
+      text: chip.textContent.replace(/\s+/g, ' ').trim(),
+      dashedOutline: chip.classList.contains('border-dashed'),
+      pill: chip.classList.contains('rounded-full'),
+      clockIcon: !!chip.querySelector('svg[data-icon="clock"]'),
+      warningIcon: !!chip.querySelector('svg[data-icon="triangleAlert"]'),
+    }));
+  };
+
+  console.log('\n  -- each chip says how its quote was found, in shape and words');
+  check('verbatim: a solid pill with no label',
+    looks([verbatim({ quote: 'Found as said.', timestamp: '05:00' })]),
+    [{ status: 'verbatim', text: '05:00 “Found as said.”', dashedOutline: false, pill: true, clockIcon: true, warningIcon: false }]);
+  check('abridged: a dashed pill tagged "abridged", keeping its time',
+    looks([{ quote: 'I tried it ... it helped.', timestamp: '09:30', quoteStatus: 'abridged' }]),
+    [{ status: 'abridged', text: '09:30 abridged “I tried it ... it helped.”', dashedOutline: true, pill: true, clockIcon: true, warningIcon: false }]);
+  check('abridged without a time still says so',
+    looks([{ quote: 'I tried it ... it helped.', timestamp: null, quoteStatus: 'abridged' }])[0].text,
+    'time not available abridged “I tried it ... it helped.”');
+  check('the abridged tag explains what it means',
+    $('evidenceChips').querySelector('[title^="Abridged:"]')?.textContent, 'abridged');
+  check('unverified: a squared-off chip with a warning icon and "unverified" in place of a time',
+    looks([{ quote: 'Paraphrased.', timestamp: null, quoteStatus: 'unverified' }]),
+    [{ status: 'unverified', text: 'unverified “Paraphrased.”', dashedOutline: false, pill: false, clockIcon: false, warningIcon: true }]);
+  check('the unverified label explains what it means',
+    $('evidenceChips').querySelector('[title^="Unverified:"]')?.textContent, 'unverified');
+  check('an unverified quote never shows a time, even if the draft carries one',
+    looks([{ quote: 'Paraphrased.', timestamp: '05:00', quoteStatus: 'unverified' }]).map(({ text, clockIcon }) => ({ text, clockIcon })),
+    [{ text: 'unverified “Paraphrased.”', clockIcon: false }]);
+  check('all three side by side',
+    looks([
+      verbatim({ quote: 'Found.', timestamp: '01:00' }),
+      { quote: 'Found ... shortened.', timestamp: '02:00', quoteStatus: 'abridged' },
+      { quote: 'Not found.', timestamp: '03:00', quoteStatus: 'unverified' },
+    ]).map((chip) => chip.text),
+    ['01:00 “Found.”', '02:00 abridged “Found ... shortened.”', 'unverified “Not found.”']);
+
+  console.log('\n  -- a quote the server did not mark as found reads as unverified');
+  check('no status at all', looks([{ quote: 'No status.', timestamp: '01:30' }])[0].text, 'unverified “No status.”');
+  check('statuses the server never sends',
+    ['VERBATIM', 'verified', 'exact', '', true, ['verbatim'], { status: 'verbatim' }]
+      .map((quoteStatus) => looks([{ quote: 'Odd status.', timestamp: '01:30', quoteStatus }])[0].status),
+    ['unverified', 'unverified', 'unverified', 'unverified', 'unverified', 'unverified', 'unverified']);
+  check('quote markup is shown as text on an unverified chip',
+    [looks([{ quote: '<img src=x>', quoteStatus: 'unverified' }])[0].text, $('evidenceChips').querySelector('img')],
+    ['unverified “<img src=x>”', null]);
+
+  /*
+   * A chip with no quote text used to render the quote as "undefined" (or
+   * "null", "", "[object Object]"). The quote is the evidence, so such an item
+   * gets no chip; with nothing left, the panel shows its empty state.
+   */
+  const EMPTY_STATE = [{ text: 'No explicit timestamp quotes referenced.', clockIcon: false }];
+
+  console.log('\n  -- an item with no quote text gets no chip');
+  check('quote field missing', render([{ timestamp: '01:30' }]), EMPTY_STATE);
+  check('quote null', render([{ quote: null, timestamp: '01:30' }]), EMPTY_STATE);
+  check('empty and whitespace quotes', render([{ quote: '' }, { quote: '   ' }]), EMPTY_STATE);
+  check('non-string quotes', render([{ quote: 42 }, { quote: { text: 'hi' } }]), EMPTY_STATE);
+  check('a real quote among them keeps its chip, alone',
+    render([{ timestamp: '01:30' }, verbatim({ quote: 'Real.', timestamp: '01:30' }), { quote: '' }]),
+    [timed('01:30', 'Real.')]);
+  check('no "undefined", "null" or "[object Object]" on the panel',
+    /undefined|null|\[object Object\]/.test($('evidenceChips').textContent), false);
+
+  // These threw a TypeError before, so they run last.
+  console.log('\n  -- items and lists that are not evidence at all');
+  check('null and non-object items', render([null, 'x', 7]), EMPTY_STATE);
+  check('evidence that is null', render(null), EMPTY_STATE);
+  check('evidence that is a string', render('x'), EMPTY_STATE);
+
+  window.close();
+  return results;
+};

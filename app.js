@@ -50,9 +50,16 @@ const state = {
   timerInterval: null,
   baseTranscript: '',
   speechTranscriptBuffer: '',
-  transcript: `Client: I've been feeling more anxious lately... it's like this tightness in my chest that won't go away regardless of what I do to try and relax.
-Therapist: Let's explore what triggers that. Does it happen at specific times of the day or during certain activities?
-Client: It usually starts right as I'm getting ready for work in the morning...`,
+  /*
+   * Starts empty, deliberately.
+   *
+   * This used to hold a three-line sample conversation. If the microphone
+   * failed and the clinician typed nothing, that sample was what got drafted —
+   * a confident note about a session that never happened, from content the user
+   * never saw. Sample text now lives only behind the button that loads it, and
+   * executeNoteGeneration() refuses to send an empty transcript.
+   */
+  transcript: '',
   selectedFormat: 'DAP', // 'DAP', 'SOAP', 'BOTH'
   selectedPurpose: 'progress', // 'progress', 'billing', 'insurance'
   generatedNoteResponse: null,
@@ -162,8 +169,9 @@ function bindEventListeners() {
   // 3. Confirm Consent Button
   if (elements.confirmConsentBtn) {
     elements.confirmConsentBtn.addEventListener('click', () => {
+      // The button stays disabled until consent is given (applyConsentState), so
+      // this is a guard, not a prompt: a session never starts without consent.
       if (!state.consentGiven && elements.consentCheckbox && !elements.consentCheckbox.checked) {
-        alert('Please confirm client consent to proceed.');
         return;
       }
       showScreen('recording-screen');
@@ -289,6 +297,14 @@ function bindEventListeners() {
   document.querySelectorAll('[data-action="new-session"], #startNewSessionBtn').forEach(btn => {
     btn.addEventListener('click', resetSessionState);
   });
+
+  // 8b. Taking the note away. Both read state.approvedNote, so what leaves the
+  //     app is the edited note rather than the model's original draft.
+  const copyBtn = document.getElementById('copyNoteBtn');
+  if (copyBtn) copyBtn.addEventListener('click', copyApprovedNote);
+
+  const downloadBtn = document.getElementById('downloadNoteBtn');
+  if (downloadBtn) downloadBtn.addEventListener('click', downloadApprovedNote);
 
   // 9. Header lockup returns home. Mid-session it discards, so it confirms.
   const homeLockup = document.getElementById('homeLockup');
@@ -535,6 +551,9 @@ function showScreen(screenId) {
   });
 
   // The processing overlay animates its checklist only while it is on screen.
+  // A stale "no transcript" message would outlive the problem it describes.
+  if (screenId === 'purpose-screen') clearPurposeError();
+
   if (screenId === 'processing-screen') startProcessingSteps();
   else stopProcessingSteps();
 
@@ -933,9 +952,28 @@ function teardownRecording() {
   state.speechRestarts = 0;
 }
 
-async function startAudioRecording() {
-  // Never stack a second attempt on top of a live one.
+/**
+ * Tears the recording down for good, discarding what it captured.
+ *
+ * MediaRecorder hands its audio over after stop() returns — with no timeslice
+ * the whole recording arrives in one late dataavailable, then stop — and onstop
+ * rebuilds the playback from it. Stop wants exactly that. A reset or a fresh
+ * start does not: left attached, those handlers put the discarded recording
+ * back into state and onto a visible player (verified in headless Chrome).
+ * Detaching them before the teardown means nothing comes back.
+ */
+function discardRecording() {
+  if (state.mediaRecorder) {
+    state.mediaRecorder.ondataavailable = null;
+    state.mediaRecorder.onstop = null;
+  }
   teardownRecording();
+}
+
+async function startAudioRecording() {
+  // Never stack a second attempt on top of a live one, and never let that
+  // one's late audio land in this session.
+  discardRecording();
 
   state.audioChunks = [];
   state.recordingSeconds = 0;
@@ -1061,14 +1099,43 @@ function updateTimerDisplay() {
 /**
  * Execute Note Generation API Call
  */
-async function executeNoteGeneration() {
-  showScreen('processing-screen');
+/** The purpose screen's error panel, built in the original markup but never wired. */
+function showPurposeError(message) {
+  const panel = document.getElementById('purposeError');
+  const text = document.getElementById('purposeErrorText');
+  if (text) text.textContent = message;
+  if (panel) panel.hidden = false;
+}
 
+function clearPurposeError() {
+  const panel = document.getElementById('purposeError');
+  if (panel) panel.hidden = true;
+}
+
+async function executeNoteGeneration() {
   // Read current transcript from textarea or state
   let currentTranscript = state.transcript;
   if (elements.transcriptInput && elements.transcriptInput.value) {
     currentTranscript = elements.transcriptInput.value;
   }
+
+  /*
+   * Nothing was said, so there is nothing to draft from. Refusing here is what
+   * makes the empty-transcript case safe: the model is never asked to write a
+   * note about a session it has no record of, and the user is told plainly
+   * rather than being handed a draft built from whatever happened to be around.
+   * Checked before the processing overlay so the message lands on a screen the
+   * user is actually looking at.
+   */
+  if (!currentTranscript || !currentTranscript.trim()) {
+    showPurposeError(
+      'There is no transcript to draft from. Record the session, type it in, or load the sample transcript, then try again.'
+    );
+    return;
+  }
+
+  clearPurposeError();
+  showScreen('processing-screen');
 
   const payload = {
     transcript: currentTranscript,
@@ -1081,7 +1148,19 @@ async function executeNoteGeneration() {
   };
 
   try {
-    console.log('[HushNote Client] Calling POST /api/generate-note with payload:', payload);
+    /*
+     * Shape only, never content. This used to log the whole payload, which put
+     * the full session transcript into the browser console — where it outlives
+     * the "approve and wipe" step in DevTools history, and sits in plain view of
+     * anyone looking over the clinician's shoulder. The same applies to the
+     * response and the approved note below.
+     */
+    console.log('[HushNote Client] POST /api/generate-note', {
+      format: payload.format,
+      purpose: payload.purpose,
+      durationSeconds: payload.durationSeconds,
+      transcriptChars: payload.transcript.length
+    });
 
     const response = await fetch('/api/generate-note', {
       method: 'POST',
@@ -1094,7 +1173,12 @@ async function executeNoteGeneration() {
     }
 
     const data = await response.json();
-    console.log('[HushNote Client] Received note generation response:', data);
+    console.log('[HushNote Client] Note response', {
+      source: data.source,
+      fallback: Boolean(data.fallback),
+      model: data.model,
+      evidenceCount: Array.isArray(data.evidence) ? data.evidence.length : 0
+    });
 
     state.generatedNoteResponse = data;
     // A new draft replaces the old one, so edits to the previous draft must not
@@ -1111,8 +1195,12 @@ async function executeNoteGeneration() {
 
   } catch (error) {
     console.error('[HushNote Client] Note generation error:', error);
-    alert(`Note generation failed: ${error.message}. Please verify the backend server is running.`);
+    // The screen goes first: showing the purpose screen clears its error panel,
+    // so a message raised before it would be wiped the moment it appeared.
     showScreen('purpose-screen');
+    showPurposeError(
+      `The note could not be drafted: ${error.message}. Check that the HushNote server is running, then try again.`
+    );
   }
 }
 
@@ -1131,7 +1219,7 @@ const ICON = {
 
 /** `size` is a Tailwind size-* step; `tone` a text-* colour utility. */
 function icon(name, size = 4, tone = '') {
-  return `<svg class="icon size-${size} ${tone}" viewBox="0 0 24 24" aria-hidden="true">${ICON[name]}</svg>`;
+  return `<svg class="icon size-${size} ${tone}" data-icon="${name}" viewBox="0 0 24 24" aria-hidden="true">${ICON[name]}</svg>`;
 }
 
 function escapeHtml(value) {
@@ -1271,9 +1359,9 @@ function renderFallbackNotice(data) {
 
 /**
  * In fallback mode there is nothing to approve, so the primary action changes
- * identity rather than being disabled outright: POST /api/delete-raw-session is
- * the only path that clears activeRawSession on the server, and blocking it
- * would strand the raw transcript in memory — the opposite of the promise.
+ * identity rather than being disabled outright: the clinician still needs a way
+ * to clear the audio and transcript from this tab, and a disabled button would
+ * leave them sitting in memory — the opposite of the promise.
  */
 function applyFallbackGate(isFallback) {
   state.isFallback = Boolean(isFallback);
@@ -1296,6 +1384,121 @@ function paintSuccessCopy(discardOnly) {
       ? 'No note was drafted, and the raw data is gone.'
       : 'Everything else is gone.';
   }
+
+  // Nothing to copy or download when the draft was discarded.
+  const exportActions = document.getElementById('exportActions');
+  if (exportActions) exportActions.hidden = discardOnly || !state.approvedNote;
+}
+
+/* ------------------------------------------------------------------ *
+ * Leaving with the note
+ * ------------------------------------------------------------------ */
+
+const NOTE_SECTION_LABELS = {
+  data: 'Data',
+  subjective: 'Subjective',
+  objective: 'Objective',
+  assessment: 'Assessment',
+  plan: 'Plan',
+};
+
+/** Mirrors the order renderReviewScreen() lays the fields out in. */
+function noteSectionOrder() {
+  return (state.selectedFormat === 'SOAP' || state.selectedFormat === 'BOTH')
+    ? ['subjective', 'objective', 'assessment', 'plan']
+    : ['data', 'assessment', 'plan'];
+}
+
+/**
+ * The approved note as plain text.
+ *
+ * Reads state.approvedNote — the clinician's edits as captured at approval —
+ * never state.generatedNoteResponse, which still holds what the model first
+ * wrote. An empty section is marked "not documented" rather than omitted, so a
+ * gap in the record is visible instead of silently disappearing.
+ */
+function formatApprovedNoteText() {
+  const note = state.approvedNote;
+  if (!note) return '';
+
+  const stamp = new Date().toLocaleDateString(undefined, {
+    year: 'numeric', month: 'long', day: 'numeric'
+  });
+
+  const lines = [
+    'HushNote — Clinical Progress Note',
+    `${state.selectedFormat} format · ${stamp}`,
+    ''
+  ];
+
+  for (const key of noteSectionOrder()) {
+    const entries = Array.isArray(note[key]) ? note[key].filter(Boolean) : [];
+    lines.push(NOTE_SECTION_LABELS[key].toUpperCase());
+    if (entries.length) {
+      for (const entry of entries) lines.push(`- ${entry}`);
+    } else {
+      lines.push('(not documented)');
+    }
+    lines.push('');
+  }
+
+  return `${lines.join('\n').trimEnd()}\n`;
+}
+
+/** Brief label swap, so a click that produces no visible change still lands. */
+function flashLabel(labelId, temporary, revertTo) {
+  const el = document.getElementById(labelId);
+  if (!el) return;
+  el.textContent = temporary;
+  window.setTimeout(() => { el.textContent = revertTo; }, 2000);
+}
+
+async function copyApprovedNote() {
+  const text = formatApprovedNoteText();
+  if (!text) return;
+
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(text);
+    } else {
+      // The async clipboard API needs a secure context. Fall back so the button
+      // still works when the app is served over plain http on a LAN address.
+      const scratch = document.createElement('textarea');
+      scratch.value = text;
+      scratch.setAttribute('readonly', '');
+      scratch.style.position = 'fixed';
+      scratch.style.opacity = '0';
+      document.body.appendChild(scratch);
+      scratch.select();
+      document.execCommand('copy');
+      document.body.removeChild(scratch);
+    }
+    flashLabel('copyNoteLabel', 'Copied', 'Copy to clipboard');
+  } catch (err) {
+    console.error('[HushNote Client] Copy failed:', err);
+    flashLabel('copyNoteLabel', 'Copy failed — select the text manually', 'Copy to clipboard');
+  }
+}
+
+function downloadApprovedNote() {
+  const text = formatApprovedNoteText();
+  if (!text) return;
+
+  const stamp = new Date().toISOString().slice(0, 10);
+  const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = `hushnote-note-${stamp}.txt`;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+
+  // Revoking in the same tick can cancel the download in some browsers.
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+
+  flashLabel('downloadNoteLabel', 'Downloaded', 'Download as .txt');
 }
 
 /**
@@ -1339,6 +1542,81 @@ function renderUnavailableReview() {
     elements.missingFields.innerHTML =
       '<p class="text-body-sm leading-relaxed text-ink-muted">Readiness, billing codes and audit checks are assessed only against a drafted note.</p>';
   }
+}
+
+/**
+ * The time an evidence quote was said, if the draft actually supplied one.
+ *
+ * Returns null unless the value reads as a clock time ("01:30", "1:02:03", or
+ * bracketed as the transcript writes it). A missing, blank or prose value is
+ * never filled in: this used to show "00:15" for any quote without a time,
+ * presenting an invented moment exactly like a real one.
+ */
+function evidenceTime(value) {
+  if (typeof value !== 'string') return null;
+  const match = value.trim().match(/^\[?(\d{1,2}:[0-5]\d(?::[0-5]\d)?)\]?$/);
+  return match ? match[1] : null;
+}
+
+/**
+ * Whether an evidence item has quote text to show. The quote is the evidence,
+ * so without one a chip has nothing to say and the item gets no chip at all,
+ * rather than one reading "undefined", "null" or "[object Object]". A missing
+ * time is different: a real quote can still say "time not available".
+ */
+function hasQuoteText(ev) {
+  return !!ev && typeof ev === 'object' && typeof ev.quote === 'string' && ev.quote.trim() !== '';
+}
+
+/**
+ * How the server found an evidence quote in the transcript: 'verbatim',
+ * 'abridged' or 'unverified' (see verify-evidence.js). Anything else, including
+ * no status at all, is treated as unverified: the browser cannot check a quote
+ * itself, so it never presents one as found without the server saying so.
+ */
+function quoteStatus(ev) {
+  return ev.quoteStatus === 'verbatim' || ev.quoteStatus === 'abridged' ? ev.quoteStatus : 'unverified';
+}
+
+/**
+ * One evidence chip. Each quote status reads differently in shape and words,
+ * never colour alone, since passing off an edited or unfound quote as the
+ * client's exact words has clinical stakes:
+ *
+ * - verbatim: a solid pill, as before.
+ * - abridged: a dashed pill with an "abridged" tag, because what was left out
+ *   of the quote can change its meaning.
+ * - unverified: a squared-off chip with a warning icon and "unverified" in
+ *   place of a time; it never shows one.
+ *
+ * The clock icon and the time appear only with a real time; without one the
+ * chip says so, since an icon alone would still imply a moment.
+ */
+function evidenceChip(ev) {
+  const status = quoteStatus(ev);
+  const quote = `<span class="truncate${status === 'unverified' ? ' text-ink-muted' : ''}" title="${escapeHtml(ev.quote)}">&ldquo;${escapeHtml(ev.quote)}&rdquo;</span>`;
+
+  if (status === 'unverified') {
+    return `
+          <span class="inline-flex max-w-full items-center gap-1.5 rounded-control border border-warn bg-warn-soft px-3 py-1.5 text-body-sm text-ink" data-quote-status="unverified">
+            ${icon('triangleAlert', 4, 'text-warn')}
+            <span class="shrink-0 font-semibold text-warn" title="Unverified: not found in the transcript as written, or too short to count as evidence. Check it against the session before relying on it.">unverified</span>
+            ${quote}
+          </span>`;
+  }
+
+  const time = evidenceTime(ev.timestamp);
+  const when = time
+    ? `${icon('clock', 4, 'text-accent')}
+            <span class="font-semibold tabular-nums text-accent">${escapeHtml(time)}</span>`
+    : '<span class="shrink-0 italic text-ink-subtle">time not available</span>';
+  const abridged = status === 'abridged';
+  return `
+          <span class="inline-flex max-w-full items-center gap-1.5 rounded-full border ${abridged ? 'border-dashed border-line-strong' : 'border-line'} bg-surface px-3 py-1.5 text-body-sm text-ink" data-quote-status="${status}">
+            ${when}
+            ${abridged ? '<span class="shrink-0 rounded-full border border-line-strong px-2 text-overline uppercase text-ink-muted" title="Abridged: shortened with “...” or [ ]. The words shown are in the transcript, but what was left out can change the meaning, so check the full passage.">abridged</span>' : ''}
+            ${quote}
+          </span>`;
 }
 
 /**
@@ -1394,16 +1672,14 @@ function renderReviewScreen(data) {
       : 'inline-flex items-center rounded-full border border-line bg-warn-soft px-3 py-1 text-overline uppercase text-warn';
   }
 
-  // 3. Timestamped evidence chips
+  // 3. Evidence chips — only items with quote text. Each chip says whether its
+  //    quote was found verbatim, abridged or not at all, and shows a time only
+  //    where the draft supplied a real one. Evidence that is not a list counts as none.
   if (elements.evidenceChips) {
-    elements.evidenceChips.innerHTML = evidence.length === 0
+    const quotes = (Array.isArray(evidence) ? evidence : []).filter(hasQuoteText);
+    elements.evidenceChips.innerHTML = quotes.length === 0
       ? '<p class="font-display text-body-sm italic text-ink-subtle">No explicit timestamp quotes referenced.</p>'
-      : evidence.map(ev => `
-          <span class="inline-flex max-w-full items-center gap-1.5 rounded-full border border-line bg-surface px-3 py-1.5 text-body-sm text-ink">
-            ${icon('clock', 4, 'text-accent')}
-            <span class="font-semibold tabular-nums text-accent">${escapeHtml(ev.timestamp || '00:15')}</span>
-            <span class="truncate" title="${escapeHtml(ev.quote)}">&ldquo;${escapeHtml(ev.quote)}&rdquo;</span>
-          </span>`).join('');
+      : quotes.map(evidenceChip).join('');
   }
 
   /*
@@ -1516,11 +1792,38 @@ function renderReviewScreen(data) {
 }
 
 /**
+ * Tells the server a session was approved or discarded.
+ *
+ * There is nothing for it to delete — the server keeps no session data — so the
+ * call exists for the audit event a production build would record there. It
+ * gates nothing: the browser's copy is cleared whether or not this succeeds.
+ * A failure is logged rather than shown, because no failure here can leave
+ * session data exposed, and the log carries the outcome only, never content.
+ */
+async function recordWipeEvent() {
+  try {
+    console.log('[HushNote Client] Calling POST /api/delete-raw-session');
+    const response = await fetch('/api/delete-raw-session', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessionId: 'active' })
+    });
+    if (!response.ok) {
+      console.warn(`[HushNote Client] Wipe event not recorded: server returned status ${response.status}`);
+      return;
+    }
+    console.log('[HushNote Client] Wipe event recorded');
+  } catch (error) {
+    console.warn('[HushNote Client] Wipe event not recorded:', error.message);
+  }
+}
+
+/**
  * Approve Note & Purge Raw Data
  */
 async function executeApproveAndDelete() {
-  // Captured up front: the purge clears state, and the error path below needs
-  // to restore the button to whichever identity it started with.
+  // Captured up front: the purge clears state, and the success copy still needs
+  // to know which of the two actions this was.
   const discardOnly = state.isFallback;
 
   /*
@@ -1540,51 +1843,84 @@ async function executeApproveAndDelete() {
       + `<path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg><span>${discardOnly ? 'Discarding…' : 'Purging raw data…'}</span>`;
   }
 
-  try {
-    console.log('[HushNote Client] Calling POST /api/delete-raw-session');
+  // Sent first, awaited last: the local wipe below never waits on the server.
+  const wipeEvent = recordWipeEvent();
 
-    const response = await fetch('/api/delete-raw-session', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ sessionId: 'active' })
+  /*
+   * Capture the note as the clinician left it BEFORE the raw data goes. This
+   * is the whole point of the review screen: what gets kept is the edited
+   * note, not what the model originally wrote.
+   */
+  if (!discardOnly) {
+    state.approvedNote = getFinalNote();
+    console.log('[HushNote Client] Approved note captured', {
+      sections: Object.keys(state.approvedNote).filter(
+        key => Array.isArray(state.approvedNote[key]) && state.approvedNote[key].length > 0
+      )
     });
-
-    const resData = await response.json();
-    console.log('[HushNote Client] Raw session purged response:', resData);
-
-    /*
-     * Capture the note as the clinician left it BEFORE the raw data goes. This
-     * is the whole point of the review screen: what gets kept is the edited
-     * note, not what the model originally wrote.
-     */
-    if (!discardOnly) {
-      state.approvedNote = getFinalNote();
-      console.log('[HushNote Client] Approved note captured:', state.approvedNote);
-    }
-
-    // Clear raw audio and transcript from client memory
-    if (state.audioUrl) {
-      URL.revokeObjectURL(state.audioUrl);
-      state.audioUrl = null;
-    }
-    state.audioChunks = [];
-    state.transcript = '';
-    state.consentGiven = false;
-
-    paintSuccessCopy(discardOnly);
-
-    setTimeout(() => {
-      showScreen('success-screen');
-    }, 600);
-
-  } catch (error) {
-    console.error('[HushNote Client] Error purging raw session:', error);
-    alert('Failed to delete raw session data from backend server.');
-    if (elements.approveDeleteBtn) {
-      elements.approveDeleteBtn.disabled = false;
-      elements.approveDeleteBtn.innerHTML = discardOnly ? DISCARD_HTML : APPROVE_HTML;
-    }
   }
+
+  clearRawSessionData();
+  state.consentGiven = false;
+
+  paintSuccessCopy(discardOnly);
+
+  setTimeout(() => {
+    showScreen('success-screen');
+    // Only once the overlay covers it: emptying the panels any earlier would
+    // blank the review screen while the button still shows its spinner.
+    clearReviewPanels();
+  }, 600);
+
+  await wipeEvent;
+}
+
+/**
+ * Drops every browser-side copy of the raw session: the recording, the
+ * transcript wherever it is kept, and the draft. The approved note is not raw
+ * data and is left alone; callers capture it first and clear it themselves.
+ */
+function clearRawSessionData() {
+  discardRecording();
+
+  /*
+   * Revoking the object URL is not enough on its own: media the player already
+   * loaded stays playable, and removing src without load() changes nothing
+   * either (both verified in headless Chrome). pause → remove src → load()
+   * empties the element; src = '' would fire an error event instead.
+   */
+  if (elements.audioPlayback) {
+    elements.audioPlayback.pause();
+    elements.audioPlayback.removeAttribute('src');
+    elements.audioPlayback.load();
+    elements.audioPlayback.hidden = true;
+  }
+  if (state.audioUrl) URL.revokeObjectURL(state.audioUrl);
+  state.audioUrl = null;
+  state.audioChunks = [];
+
+  // The transcript, in every place it lives. Drafting reads the textarea first.
+  state.transcript = '';
+  state.baseTranscript = '';
+  state.speechTranscriptBuffer = '';
+  if (elements.transcriptInput) elements.transcriptInput.value = '';
+
+  // The draft, and the edits made to it.
+  state.generatedNoteResponse = null;
+  state.noteOriginals = {};
+  state.noteEdits = {};
+}
+
+/**
+ * Empties the review screen, which holds the draft's text, quotes lifted from
+ * the transcript, and session details. Every render rewrites all of these, so
+ * clearing them cannot affect the next draft.
+ */
+function clearReviewPanels() {
+  if (elements.noteBody) elements.noteBody.innerHTML = '';
+  if (elements.evidenceChips) elements.evidenceChips.innerHTML = '';
+  if (elements.missingFields) elements.missingFields.innerHTML = '';
+  if (elements.readinessLabel) elements.readinessLabel.textContent = '';
 }
 
 /**
@@ -1596,18 +1932,18 @@ function resetSessionState() {
    * previously left isRecording true, a stale mediaRecorder, and a live
    * recogniser behind, so a second session inherited the first one's broken
    * state — and an undead recogniser kept the microphone indicator lit.
+   *
+   * clearRawSessionData() does that teardown, discarding what was captured, and
+   * clears every copy of the session's words and audio. Without it a new
+   * session inherited the previous transcript, so one client's session could be
+   * drafted into another's note.
    */
-  teardownRecording();
+  clearRawSessionData();
+  clearReviewPanels();
   setMicState('idle');
 
   state.recordingSeconds = 0;
   state.consentGiven = false;
-  state.audioChunks = [];
-  if (state.audioUrl) URL.revokeObjectURL(state.audioUrl);
-  state.audioUrl = null;
-  state.generatedNoteResponse = null;
-  state.noteOriginals = {};
-  state.noteEdits = {};
   state.approvedNote = null;
 
   // Clears the offline notice and returns the primary action to "Approve",
@@ -1652,5 +1988,8 @@ window.HushNoteApp = {
   getFinalNote,
   setMicState,
   teardownRecording,
-  startSpeechRecognition
+  startSpeechRecognition,
+  formatApprovedNoteText,
+  copyApprovedNote,
+  downloadApprovedNote
 };
